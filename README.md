@@ -18,6 +18,7 @@ An out-of-tree build of the `mt76x2u` Wi-Fi driver for the GL.iNet GL-MT3600BE t
 
 - `out/` — built modules plus MT7662 firmware, with `MD5`, and `kernel.version` (the `/proc/version` of the kernel they were built for).
 - `router-files/alfa.init` — the `/etc/init.d/alfa` service.
+- `router-files/alfa.hotplug` — restarts the service when the adapter appears (late USB enumeration at boot, re-plug).
 - `router-dump/` — ground truth pulled from the router: `kernel.config` (`/proc/config.gz`), `kallsyms.txt`, and GL's own `.ko` files used as reference binaries.
 - `src/prep.sh`, `src/cfg.sh`, `src/pkg.sh` — build steps.
 - `src/fix/` — patches. In use: `bp-0001`, `bp-0002`, `mtk-0010` (backports 6.5 on kernel 5.4) and `900-mtk-build-pass-for-kernel-5.4-core.patch` (mt76). The `mt76-0999*`, `mt76-2000*` files and `dmafix.py` are abandoned attempts, kept for reference.
@@ -71,7 +72,7 @@ On the router:
 
 1. Copy `out/*.ko` and `out/kernel.version` to `/usr/lib/alfa/`, and `out/mt7662*.bin` to `/lib/firmware/`.
 2. Run `cmp /proc/version /usr/lib/alfa/kernel.version`. If it reports a difference, stop: your kernel is not the one these modules were built for, and the service will refuse to load them. Do not overwrite `kernel.version` to get past this. If it is silent, `touch /usr/lib/alfa/.ok`.
-3. Copy `router-files/alfa.init` to `/etc/init.d/alfa`, make it executable, then `/etc/init.d/alfa enable && /etc/init.d/alfa restart`.
+3. Copy `router-files/alfa.hotplug` to `/etc/hotplug.d/ieee80211/99-alfa`. Copy `router-files/alfa.init` to `/etc/init.d/alfa`, make it executable, then `/etc/init.d/alfa enable && /etc/init.d/alfa restart`.
 4. Add a DHCP interface on `alfa0` (here `network.alfawan`, metric 18) and put it in the firewall wan zone.
 
 Restarting the service or rebooting drops the uplink, and with it any SSH session routed through it.

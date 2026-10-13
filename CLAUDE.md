@@ -22,6 +22,7 @@ Without MODVERSIONS the kernel will load a module built against the wrong struct
 - `src/od.py`, `src/od2.py` — disassembly diff helpers for comparing a built module against GL's.
 - `out/` — built modules plus MT7662 firmware, with `MD5`.
 - `router-files/alfa.init` — source of `/etc/init.d/alfa` on the router.
+- `router-files/alfa.hotplug` — source of `/etc/hotplug.d/ieee80211/99-alfa`; restarts the service when the adapter's phy appears (it enumerates ~70 s into boot, after the init script has given up).
 
 ## Build
 
@@ -62,4 +63,4 @@ How the pieces fit:
 - Router busybox lacks `diff` and `paste`; use `cmp`.
 - Pre-change configs are in `/root/alfa-backup/` on the router.
 
-Deploy: copy `out/*.ko` to `/usr/lib/alfa/`, firmware to `/lib/firmware/`, `router-files/alfa.init` to `/etc/init.d/alfa`, then `/etc/init.d/alfa restart`. Restarting or rebooting drops the uplink, and with it any SSH session routed through it.
+Deploy: copy `out/*.ko` to `/usr/lib/alfa/`, firmware to `/lib/firmware/`, `router-files/alfa.init` to `/etc/init.d/alfa`, `router-files/alfa.hotplug` to `/etc/hotplug.d/ieee80211/99-alfa`, then `/etc/init.d/alfa restart`. Restarting or rebooting drops the uplink, and with it any SSH session routed through it.

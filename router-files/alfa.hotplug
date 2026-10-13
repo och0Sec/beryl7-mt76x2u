@@ -1,0 +1,6 @@
+#!/bin/sh
+# The Alfa enumerates after /etc/init.d/alfa has given up waiting at boot, and
+# may be re-plugged later: (re)start the service whenever its phy appears.
+[ "$ACTION" = add ] || exit 0
+[ "$(basename "$(readlink /sys$DEVPATH/device/driver)")" = mt76x2u ] || exit 0
+/etc/init.d/alfa restart &
