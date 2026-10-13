@@ -1,0 +1,79 @@
+#!/bin/sh /etc/rc.common
+# Alfa AWUS036ACM (MT7612U) as Wi-Fi uplink: loads the out-of-tree mt76x2u
+# modules and runs a dedicated wpa_supplicant on alfa0 (network 'alfawan').
+
+START=99
+USE_PROCD=1
+
+D=/usr/lib/alfa
+IF=alfa0
+CONF=/var/run/alfa-wpa.conf
+
+load_modules() {
+	[ -d /sys/module/mt76x2u ] && return 0
+	# modules were built for one exact kernel build; never load on another
+	cmp -s /proc/version $D/kernel.version || { logger -t alfa "kernel changed, not loading modules"; return 1; }
+	# crash guard: .ok is removed before loading and restored after
+	[ -f $D/.ok ] || { logger -t alfa "last module load did not finish; touch $D/.ok to re-arm"; return 1; }
+	if [ -d /sys/module/mac80211 ]; then
+		# GL's feed mac80211.ko does not match this kernel's net_device layout
+		rmmod mt7601u 2>/dev/null
+		rmmod mac80211 || return 1
+	fi
+	rm -f $D/.ok; sync
+	for m in mac80211 mt76 mt76-usb mt76x02-lib mt76x02-usb mt76x2-common mt76x2u; do
+		insmod $D/$m.ko || return 1
+	done
+	sleep 5
+	touch $D/.ok; sync
+}
+
+find_phy() {
+	local p
+	for p in /sys/class/ieee80211/*; do
+		[ "$(basename "$(readlink $p/device/driver)")" = mt76x2u ] && { basename $p; return 0; }
+	done
+	return 1
+}
+
+write_conf() {
+	# follow the network selected in the GL Repeater page
+	local s ssid key
+	s=$(uci show repeater | sed -n "s/^\(repeater\.[^.]*\)\.selected='1'$/\1/p" | head -1)
+	[ -n "$s" ] || return 1
+	ssid=$(uci -q get $s.ssid); key=$(uci -q get $s.key)
+	[ -n "$ssid" ] || return 1
+	{
+		echo "ctrl_interface=/var/run/wpa_supplicant-alfa"
+		echo "country=US"
+		echo "network={"
+		echo "	ssid=$(printf %s "$ssid" | hexdump -v -e '/1 "%02x"')"
+		echo "	scan_ssid=1"
+		if [ -n "$key" ]; then
+			echo "	key_mgmt=WPA-PSK"
+			echo "	psk=\"$key\""
+		else
+			echo "	key_mgmt=NONE"
+		fi
+		echo "}"
+	} > $CONF
+	chmod 600 $CONF
+}
+
+start_service() {
+	local phy i
+	load_modules || return 1
+	for i in 1 2 3 4 5 6 7 8 9 10; do phy=$(find_phy) && break; sleep 1; done
+	[ -n "$phy" ] || { logger -t alfa "adapter not found"; return 1; }
+	write_conf || { logger -t alfa "no selected repeater network"; return 1; }
+	iw reg set US
+	[ -d /sys/class/net/$IF ] || iw phy $phy interface add $IF type managed || return 1
+	procd_open_instance
+	procd_set_param command /usr/sbin/wpa_supplicant -D nl80211 -i $IF -c $CONF
+	procd_set_param respawn
+	procd_close_instance
+}
+
+stop_service() {
+	[ -d /sys/class/net/$IF ] && iw dev $IF del
+}

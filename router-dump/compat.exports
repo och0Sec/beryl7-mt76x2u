@@ -1,0 +1,10 @@
+backport_compat_ptr_ioctl
+backport_dependency_symbol
+backport_dev_fetch_sw_netstats
+backport_dev_get_tstats64
+backport_get_user_ifreq
+backport_mul_u64_u64_div_u64
+backport_netif_rx_any_context
+backport_put_user_ifreq
+backport_sysfs_emit
+backport_tasklet_unlock_spin_wait

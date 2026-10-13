@@ -1,0 +1,510 @@
+diff -ruN -x '.*' mt76.a/debugfs.c mt76.b/debugfs.c
+--- mt76.a/debugfs.c	2023-09-18 10:42:45.000000000 +0000
++++ mt76.b/debugfs.c	2026-10-11 22:50:21.799467007 +0000
+@@ -33,8 +33,10 @@
+ 	if (!mt76_is_mmio(dev))
+ 		return -EOPNOTSUPP;
+ 
++#if 0 /* disable in backport 5.15 */
+ 	if (dev->napi_dev.threaded != val)
+ 		return dev_set_threaded(&dev->napi_dev, val);
++#endif
+ 
+ 	return 0;
+ }
+diff -ruN -x '.*' mt76.a/dma.c mt76.b/dma.c
+--- mt76.a/dma.c	2023-09-18 10:42:45.000000000 +0000
++++ mt76.b/dma.c	2026-10-11 22:50:21.799467007 +0000
+@@ -178,7 +178,7 @@
+ 	local_bh_disable();
+ 	while ((t = __mt76_get_rxwi(dev)) != NULL) {
+ 		if (t->ptr)
+-			mt76_put_page_pool_buf(t->ptr, false);
++			skb_free_frag(t->ptr);
+ 		kfree(t);
+ 	}
+ 	local_bh_enable();
+@@ -411,9 +411,9 @@
+ 		if (!t)
+ 			return NULL;
+ 
+-		dma_sync_single_for_cpu(dev->dma_dev, t->dma_addr,
+-				SKB_WITH_OVERHEAD(q->buf_size),
+-				page_pool_get_dma_dir(q->page_pool));
++		dma_unmap_single(dev->dma_dev, t->dma_addr,
++				 SKB_WITH_OVERHEAD(q->buf_size),
++				 DMA_FROM_DEVICE);
+ 
+ 		buf = t->ptr;
+ 		t->dma_addr = 0;
+@@ -432,9 +432,9 @@
+ 	} else {
+ 		buf = e->buf;
+ 		e->buf = NULL;
+-		dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0],
+-				SKB_WITH_OVERHEAD(q->buf_size),
+-				page_pool_get_dma_dir(q->page_pool));
++		dma_unmap_single(dev->dma_dev, e->dma_addr[0],
++				 SKB_WITH_OVERHEAD(q->buf_size),
++				 DMA_FROM_DEVICE);
+ 	}
+ 
+ 	return buf;
+@@ -594,11 +594,11 @@
+ }
+ 
+ static int
+-mt76_dma_rx_fill(struct mt76_dev *dev, struct mt76_queue *q,
+-		 bool allow_direct)
++mt76_dma_rx_fill(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+ 	int len = SKB_WITH_OVERHEAD(q->buf_size);
+-	int frames = 0;
++	int frames = 0, offset = q->buf_offset;
++	dma_addr_t addr;
+ 
+ 	if (!q->ndesc)
+ 		return 0;
+@@ -606,25 +606,26 @@
+ 	spin_lock_bh(&q->lock);
+ 
+ 	while (q->queued < q->ndesc - 1) {
+-		enum dma_data_direction dir;
+ 		struct mt76_queue_buf qbuf;
+-		dma_addr_t addr;
+-		int offset;
+-		void *buf;
++		void *buf = NULL;
+ 
+-		buf = mt76_get_page_pool_buf(q, &offset, q->buf_size);
++		buf = page_frag_alloc(&q->rx_page, q->buf_size, GFP_ATOMIC);
+ 		if (!buf)
+ 			break;
+ 
+-		addr = page_pool_get_dma_addr(virt_to_head_page(buf)) + offset;
+-		dir = page_pool_get_dma_dir(q->page_pool);
+-		dma_sync_single_for_device(dev->dma_dev, addr, len, dir);
++		addr = dma_map_single(dev->dma_dev, buf, len, DMA_FROM_DEVICE);
++		if (unlikely(dma_mapping_error(dev->dma_dev, addr))) {
++			skb_free_frag(buf);
++			break;
++		}
+ 
+-		qbuf.addr = addr + q->buf_offset;
+-		qbuf.len = len - q->buf_offset;
++		qbuf.addr = addr + offset;
++		qbuf.len = len - offset;
+ 		qbuf.skip_unmap = false;
+ 		if (mt76_dma_add_rx_buf(dev, q, &qbuf, buf) < 0) {
+-			mt76_put_page_pool_buf(buf, allow_direct);
++			dma_unmap_single(dev->dma_dev, addr, len,
++					 DMA_FROM_DEVICE);
++			skb_free_frag(buf);
+ 			break;
+ 		}
+ 		frames++;
+@@ -668,7 +669,7 @@
+ 		/* WED txfree queue needs ring to be initialized before setup */
+ 		q->flags = 0;
+ 		mt76_dma_queue_reset(dev, q);
+-		mt76_dma_rx_fill(dev, q, false);
++		mt76_dma_rx_fill(dev, q);
+ 		q->flags = flags;
+ 
+ 		ret = mtk_wed_device_txfree_ring_setup(wed, q->regs);
+@@ -716,10 +717,6 @@
+ 	if (!q->entry)
+ 		return -ENOMEM;
+ 
+-	ret = mt76_create_page_pool(dev, q);
+-	if (ret)
+-		return ret;
+-
+ 	ret = mt76_dma_wed_setup(dev, q, false);
+ 	if (ret)
+ 		return ret;
+@@ -733,6 +730,7 @@
+ static void
+ mt76_dma_rx_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
+ {
++	struct page *page;
+ 	void *buf;
+ 	bool more;
+ 
+@@ -746,7 +744,7 @@
+ 		if (!buf)
+ 			break;
+ 
+-		mt76_put_page_pool_buf(buf, false);
++		skb_free_frag(buf);
+ 	} while (1);
+ 
+ 	if (q->rx_head) {
+@@ -755,6 +753,13 @@
+ 	}
+ 
+ 	spin_unlock_bh(&q->lock);
++
++	if (!q->rx_page.va)
++		return;
++
++	page = virt_to_page(q->rx_page.va);
++	__page_frag_cache_drain(page, q->rx_page.pagecnt_bias);
++	memset(&q->rx_page, 0, sizeof(q->rx_page));
+ }
+ 
+ static void
+@@ -775,7 +780,7 @@
+ 	mt76_dma_wed_setup(dev, q, true);
+ 	if (q->flags != MT_WED_Q_TXFREE) {
+ 		mt76_dma_sync_idx(dev, q);
+-		mt76_dma_rx_fill(dev, q, false);
++		mt76_dma_rx_fill(dev, q);
+ 	}
+ }
+ 
+@@ -793,7 +798,7 @@
+ 
+ 		skb_add_rx_frag(skb, nr_frags, page, offset, len, q->buf_size);
+ 	} else {
+-		mt76_put_page_pool_buf(data, true);
++		skb_free_frag(data);
+ 	}
+ 
+ 	if (more)
+@@ -861,12 +866,11 @@
+ 		    !(dev->drv->rx_check(dev, data, len)))
+ 			goto free_frag;
+ 
+-		skb = napi_build_skb(data, q->buf_size);
++		skb = build_skb(data, q->buf_size);
+ 		if (!skb)
+ 			goto free_frag;
+ 
+ 		skb_reserve(skb, q->buf_offset);
+-		skb_mark_for_recycle(skb);
+ 
+ 		*(u32 *)skb->cb = info;
+ 
+@@ -882,10 +886,10 @@
+ 		continue;
+ 
+ free_frag:
+-		mt76_put_page_pool_buf(data, true);
++		skb_free_frag(data);
+ 	}
+ 
+-	mt76_dma_rx_fill(dev, q, true);
++	mt76_dma_rx_fill(dev, q);
+ 	return done;
+ }
+ 
+@@ -930,7 +934,7 @@
+ 
+ 	mt76_for_each_q_rx(dev, i) {
+ 		netif_napi_add(&dev->napi_dev, &dev->napi[i], poll);
+-		mt76_dma_rx_fill(dev, &dev->q_rx[i], false);
++		mt76_dma_rx_fill(dev, &dev->q_rx[i]);
+ 		napi_enable(&dev->napi[i]);
+ 	}
+ 
+@@ -981,8 +985,6 @@
+ 
+ 		netif_napi_del(&dev->napi[i]);
+ 		mt76_dma_rx_cleanup(dev, q);
+-
+-		page_pool_destroy(q->page_pool);
+ 	}
+ 
+ 	mt76_free_pending_txwi(dev);
+diff -ruN -x '.*' mt76.a/eeprom.c mt76.b/eeprom.c
+--- mt76.a/eeprom.c	2023-09-18 10:42:45.000000000 +0000
++++ mt76.b/eeprom.c	2026-10-11 22:50:21.799467007 +0000
+@@ -161,9 +161,15 @@
+ mt76_eeprom_override(struct mt76_phy *phy)
+ {
+ 	struct mt76_dev *dev = phy->dev;
++#ifdef CONFIG_OF
+ 	struct device_node *np = dev->dev->of_node;
++	const u8 *mac = NULL;
+ 
+-	of_get_mac_address(np, phy->macaddr);
++	if (np)
++		mac = of_get_mac_address(np);
++	if (!IS_ERR_OR_NULL(mac))
++		ether_addr_copy(phy->macaddr, mac);
++#endif
+ 
+ 	if (!is_valid_ether_addr(phy->macaddr)) {
+ 		eth_random_addr(phy->macaddr);
+diff -ruN -x '.*' mt76.a/mac80211.c mt76.b/mac80211.c
+--- mt76.a/mac80211.c	2023-09-18 10:42:45.000000000 +0000
++++ mt76.b/mac80211.c	2026-10-11 22:50:21.799467007 +0000
+@@ -4,7 +4,6 @@
+  */
+ #include <linux/sched.h>
+ #include <linux/of.h>
+-#include <net/page_pool.h>
+ #include "mt76.h"
+ 
+ #define CHAN2G(_idx, _freq) {			\
+@@ -567,47 +566,6 @@
+ }
+ EXPORT_SYMBOL_GPL(mt76_unregister_phy);
+ 
+-int mt76_create_page_pool(struct mt76_dev *dev, struct mt76_queue *q)
+-{
+-	struct page_pool_params pp_params = {
+-		.order = 0,
+-		.flags = PP_FLAG_PAGE_FRAG,
+-		.nid = NUMA_NO_NODE,
+-		.dev = dev->dma_dev,
+-	};
+-	int idx = q - dev->q_rx;
+-
+-	switch (idx) {
+-	case MT_RXQ_MAIN:
+-	case MT_RXQ_BAND1:
+-	case MT_RXQ_BAND2:
+-		pp_params.pool_size = 256;
+-		break;
+-	default:
+-		pp_params.pool_size = 16;
+-		break;
+-	}
+-
+-	if (mt76_is_mmio(dev)) {
+-		/* rely on page_pool for DMA mapping */
+-		pp_params.flags |= PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV;
+-		pp_params.dma_dir = DMA_FROM_DEVICE;
+-		pp_params.max_len = PAGE_SIZE;
+-		pp_params.offset = 0;
+-	}
+-
+-	q->page_pool = page_pool_create(&pp_params);
+-	if (IS_ERR(q->page_pool)) {
+-		int err = PTR_ERR(q->page_pool);
+-
+-		q->page_pool = NULL;
+-		return err;
+-	}
+-
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(mt76_create_page_pool);
+-
+ struct mt76_dev *
+ mt76_alloc_device(struct device *pdev, unsigned int size,
+ 		  const struct ieee80211_ops *ops,
+@@ -1805,21 +1763,6 @@
+ }
+ EXPORT_SYMBOL_GPL(mt76_ethtool_worker);
+ 
+-void mt76_ethtool_page_pool_stats(struct mt76_dev *dev, u64 *data, int *index)
+-{
+-#ifdef CONFIG_PAGE_POOL_STATS
+-	struct page_pool_stats stats = {};
+-	int i;
+-
+-	mt76_for_each_q_rx(dev, i)
+-		page_pool_get_stats(dev->q_rx[i].page_pool, &stats);
+-
+-	page_pool_ethtool_stats_get(data, &stats);
+-	*index += page_pool_ethtool_stats_get_count();
+-#endif
+-}
+-EXPORT_SYMBOL_GPL(mt76_ethtool_page_pool_stats);
+-
+ enum mt76_dfs_state mt76_phy_dfs_state(struct mt76_phy *phy)
+ {
+ 	struct ieee80211_hw *hw = phy->hw;
+diff -ruN -x '.*' mt76.a/mcu.c mt76.b/mcu.c
+--- mt76.a/mcu.c	2023-09-18 10:42:45.000000000 +0000
++++ mt76.b/mcu.c	2026-10-11 22:50:21.799467007 +0000
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "mt76.h"
++#include <linux/moduleparam.h>
+ 
+ struct sk_buff *
+ __mt76_mcu_msg_alloc(struct mt76_dev *dev, const void *data,
+diff -ruN -x '.*' mt76.a/mt76.h mt76.b/mt76.h
+--- mt76.a/mt76.h	2023-09-18 10:42:45.000000000 +0000
++++ mt76.b/mt76.h	2026-10-11 22:50:21.800467007 +0000
+@@ -202,7 +202,7 @@
+ 
+ 	dma_addr_t desc_dma;
+ 	struct sk_buff *rx_head;
+-	struct page_pool *page_pool;
++	struct page_frag_cache rx_page;
+ };
+ 
+ struct mt76_mcu_ops {
+@@ -1442,7 +1442,6 @@
+ 	return usb_bulk_msg(udev, pipe, data, len, actual_len, timeout);
+ }
+ 
+-void mt76_ethtool_page_pool_stats(struct mt76_dev *dev, u64 *data, int *index);
+ void mt76_ethtool_worker(struct mt76_ethtool_worker_info *wi,
+ 			 struct mt76_sta_stats *stats, bool eht);
+ int mt76_skb_adjust_pad(struct sk_buff *skb, int pad);
+@@ -1554,25 +1553,6 @@
+ struct mt76_txwi_cache *mt76_rx_token_release(struct mt76_dev *dev, int token);
+ int mt76_rx_token_consume(struct mt76_dev *dev, void *ptr,
+ 			  struct mt76_txwi_cache *r, dma_addr_t phys);
+-int mt76_create_page_pool(struct mt76_dev *dev, struct mt76_queue *q);
+-static inline void mt76_put_page_pool_buf(void *buf, bool allow_direct)
+-{
+-	struct page *page = virt_to_head_page(buf);
+-
+-	page_pool_put_full_page(page->pp, page, allow_direct);
+-}
+-
+-static inline void *
+-mt76_get_page_pool_buf(struct mt76_queue *q, u32 *offset, u32 size)
+-{
+-	struct page *page;
+-
+-	page = page_pool_dev_alloc_frag(q->page_pool, offset, size);
+-	if (!page)
+-		return NULL;
+-
+-	return page_address(page) + *offset;
+-}
+ 
+ static inline void mt76_set_tx_blocked(struct mt76_dev *dev, bool blocked)
+ {
+diff -ruN -x '.*' mt76.a/usb.c mt76.b/usb.c
+--- mt76.a/usb.c	2023-09-18 10:42:45.000000000 +0000
++++ mt76.b/usb.c	2026-10-11 22:50:21.800467007 +0000
+@@ -319,27 +319,29 @@
+ 
+ static int
+ mt76u_fill_rx_sg(struct mt76_dev *dev, struct mt76_queue *q, struct urb *urb,
+-		 int nsgs)
++		 int nsgs, gfp_t gfp)
+ {
+ 	int i;
+ 
+ 	for (i = 0; i < nsgs; i++) {
++		struct page *page;
+ 		void *data;
+ 		int offset;
+ 
+-		data = mt76_get_page_pool_buf(q, &offset, q->buf_size);
++		data = page_frag_alloc(&q->rx_page, q->buf_size, gfp);
+ 		if (!data)
+ 			break;
+ 
+-		sg_set_page(&urb->sg[i], virt_to_head_page(data), q->buf_size,
+-			    offset);
++		page = virt_to_head_page(data);
++		offset = data - page_address(page);
++		sg_set_page(&urb->sg[i], page, q->buf_size, offset);
+ 	}
+ 
+ 	if (i < nsgs) {
+ 		int j;
+ 
+ 		for (j = nsgs; j < urb->num_sgs; j++)
+-			mt76_put_page_pool_buf(sg_virt(&urb->sg[j]), false);
++			skb_free_frag(sg_virt(&urb->sg[j]));
+ 		urb->num_sgs = i;
+ 	}
+ 
+@@ -352,16 +354,15 @@
+ 
+ static int
+ mt76u_refill_rx(struct mt76_dev *dev, struct mt76_queue *q,
+-		struct urb *urb, int nsgs)
++		struct urb *urb, int nsgs, gfp_t gfp)
+ {
+ 	enum mt76_rxq_id qid = q - &dev->q_rx[MT_RXQ_MAIN];
+-	int offset;
+ 
+ 	if (qid == MT_RXQ_MAIN && dev->usb.sg_en)
+-		return mt76u_fill_rx_sg(dev, q, urb, nsgs);
++		return mt76u_fill_rx_sg(dev, q, urb, nsgs, gfp);
+ 
+ 	urb->transfer_buffer_length = q->buf_size;
+-	urb->transfer_buffer = mt76_get_page_pool_buf(q, &offset, q->buf_size);
++	urb->transfer_buffer = page_frag_alloc(&q->rx_page, q->buf_size, gfp);
+ 
+ 	return urb->transfer_buffer ? 0 : -ENOMEM;
+ }
+@@ -399,7 +400,7 @@
+ 	if (err)
+ 		return err;
+ 
+-	return mt76u_refill_rx(dev, q, e->urb, sg_size);
++	return mt76u_refill_rx(dev, q, e->urb, sg_size, GFP_KERNEL);
+ }
+ 
+ static void mt76u_urb_free(struct urb *urb)
+@@ -407,10 +408,10 @@
+ 	int i;
+ 
+ 	for (i = 0; i < urb->num_sgs; i++)
+-		mt76_put_page_pool_buf(sg_virt(&urb->sg[i]), false);
++		skb_free_frag(sg_virt(&urb->sg[i]));
+ 
+ 	if (urb->transfer_buffer)
+-		mt76_put_page_pool_buf(urb->transfer_buffer, false);
++		skb_free_frag(urb->transfer_buffer);
+ 
+ 	usb_free_urb(urb);
+ }
+@@ -546,8 +547,6 @@
+ 		len -= data_len;
+ 		nsgs++;
+ 	}
+-
+-	skb_mark_for_recycle(skb);
+ 	dev->drv->rx_skb(dev, MT_RXQ_MAIN, skb, NULL);
+ 
+ 	return nsgs;
+@@ -613,7 +612,7 @@
+ 
+ 		count = mt76u_process_rx_entry(dev, urb, q->buf_size);
+ 		if (count > 0) {
+-			err = mt76u_refill_rx(dev, q, urb, count);
++			err = mt76u_refill_rx(dev, q, urb, count, GFP_ATOMIC);
+ 			if (err < 0)
+ 				break;
+ 		}
+@@ -664,10 +663,6 @@
+ 	struct mt76_queue *q = &dev->q_rx[qid];
+ 	int i, err;
+ 
+-	err = mt76_create_page_pool(dev, q);
+-	if (err)
+-		return err;
+-
+ 	spin_lock_init(&q->lock);
+ 	q->entry = devm_kcalloc(dev->dev,
+ 				MT_NUM_RX_ENTRIES, sizeof(*q->entry),
+@@ -696,6 +691,7 @@
+ static void
+ mt76u_free_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ {
++	struct page *page;
+ 	int i;
+ 
+ 	for (i = 0; i < q->ndesc; i++) {
+@@ -705,8 +701,13 @@
+ 		mt76u_urb_free(q->entry[i].urb);
+ 		q->entry[i].urb = NULL;
+ 	}
+-	page_pool_destroy(q->page_pool);
+-	q->page_pool = NULL;
++
++	if (!q->rx_page.va)
++		return;
++
++	page = virt_to_page(q->rx_page.va);
++	__page_frag_cache_drain(page, q->rx_page.pagecnt_bias);
++	memset(&q->rx_page, 0, sizeof(q->rx_page));
+ }
+ 
+ static void mt76u_free_rx(struct mt76_dev *dev)
